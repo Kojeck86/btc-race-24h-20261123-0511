@@ -1,120 +1,93 @@
-// Momentum trend-state bot for btc-race-24h-20261123-0511 (agent-fun/bars-replay/v1).
-//
-// Idea, from the dev window's own numbers: on 1-minute cbBTC bars the per-minute
-// noise is ~12 bps while a full round trip costs ~26 bps in fees, slippage and
-// impact, so frequent trading bleeds money and every classic fast signal
-// (EMA crosses, RSI mean reversion) loses to whipsaw. What does carry an edge
-// is being long while a strong move is already under way: bars whose trailing
-// 30-minute return was above +0.8% went on to average +30.6 bps over the next
-// 30 minutes, with 51% of them beating the round-trip cost, while a fresh
-// cross of that same threshold averaged -22.7 bps (the first bar of a run is
-// usually a local peak). So this bot does not chase crosses: it holds only
-// while the 30-minute momentum regime is on, and sits in cash the rest of the
-// day. It trades rarely (8 fills on the proxy dev window) and never holds
-// through a decayed trend.
-//
-//   Entry (flat, not cooling down): trailing 30-bar return above +1.0%.
-//     Full cash, one position, long only.
-//   Exit (holding), whichever comes first:
-//     - momentum decay: trailing 30-bar return below +0.2%;
-//     - take profit: close at least +2% above the entry close;
-//     - trailing stop: close at least 1% below the highest close since entry;
-//     - time stop: 180 bars held.
-//   After a sell fills, a 10-bar cooldown keeps it from re-entering the same
-//   bar's noise. Every order caps slippage at 150 bps from the decision close.
-//
-// All decisions use only the closes the harness has sent, in float64; no
-// clock, no environment, no randomness, so two runs on the same bars send
-// the same orders. Position state is reconciled from the account each batch,
-// so a rejected order never leaves a phantom position behind.
+import { runBars } from './vendor/makefun-bars.ts';
 
-import { runBars, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
+// Regime-switch trend bot for the cbBTC 24h bars race (long only, one
+// position, full size). Two ways to get long, picked by the slow trend:
+//
+// - TREND: when the trailing 240-bar return tops +1.0% the market is in a
+//   confirmed uptrend, so buy and hold it with a wide 4% trailing stop.
+//   A scalp that is still open when the trend confirms is promoted to a
+//   trend hold instead of being sold.
+// - SCALP: while the slow trend is flat or down, only trade fast 30-bar
+//   momentum: buy when the trailing 30-bar return tops +1.0%, exit when it
+//   falls back below 0%, on a +2% take-profit, or on a 1.5% trailing stop.
+//
+// Why this split: one-minute noise is ~8 bps against a ~26 bps round trip,
+// so any signal that trades often bleeds to whipsaw. The slow trend filter
+// keeps the bot in cash through chop and downtrends, the scalp leg still
+// catches sharp bounces there, and the trend leg rides a real rally instead
+// of selling it on the first pullback. Only closes are used, no clock, no
+// randomness, so two runs on the same bars answer identically. The first
+// 240 bars only build history: no entry is taken before the slow window is
+// full, which also keeps the bot out of the opening noise.
 
 const SYMBOL = 'CBBTC';
-/** Lookback for the momentum regime, in bars. */
-const LOOKBACK = 30;
-/** Entry: trailing return above this to go long. */
-const ENTRY_RET = 0.01;
-/** Exit: trailing return below this and the regime is off. */
-const EXIT_RET = 0.002;
-/** Take profit, as a fraction above the entry close. */
-const TAKE_PROFIT = 0.02;
-/** Trailing stop, as a fraction below the highest close since entry. */
-const TRAIL = 0.01;
-/** Time stop, in bars held. */
-const MAX_HOLD = 180;
-/** Bars to wait after a sell fills before entering again. */
-const COOLDOWN = 10;
-/** Max slippage vs the decision close, in bps. */
+// Slow-trend window (240 bars, about 4 hours) and the return that confirms it.
+const LONG_WIN = 240;
+const LONG_UP_BPS = 100;
+// Fast momentum window and the levels that open / close a scalp.
+const SHORT_WIN = 30;
+const SCALP_IN_BPS = 100;
+const SCALP_OUT_BPS = 0;
+const SCALP_TP_BPS = 200;
+const SCALP_TRAIL_BPS = 150;
+// Trailing stop once a trend is confirmed; bars to wait after an exit.
+const TREND_TRAIL_BPS = 400;
+const COOL_BARS = 10;
 const MAX_SLIPPAGE_BPS = 150;
 
 const closes: number[] = [];
+let peak = 0;
 let entryClose = 0;
-let peakSinceEntry = 0;
-let barsHeld = 0;
-let cooldown = 0;
-/** Close the last buy was decided on; confirmed when the position appears. */
-let pendingEntry = 0;
-
-function ret30(): number | null {
-  const n = closes.length;
-  if (n <= LOOKBACK) return null;
-  const now = closes[n - 1]!;
-  const then = closes[n - 1 - LOOKBACK]!;
-  return now / then - 1;
-}
+let coolLeft = 0;
+let mode: 'scalp' | 'trend' | '' = '';
 
 await runBars({
-  onBatch(state: BarsState, batch) {
-    for (const bar of batch.bars) {
-      if (bar.symbol === SYMBOL) closes.push(Number(bar.c));
-    }
-    if (state.warmingUp) return [];
+  onBatch(state) {
+    const bar = state.latest.get(SYMBOL);
+    if (bar === undefined) return [];
+    const close = Number(bar.c) / 1e5;
+    closes.push(close);
+    if (coolLeft > 0) coolLeft--;
 
     const held = state.positions.get(SYMBOL);
-    const close = closes.length > 0 ? closes[closes.length - 1]! : 0;
+    const qty = held === undefined ? 0n : BigInt(held.qty);
+    const inPosition = qty > 0n;
+    if (inPosition && close > peak) peak = close;
 
-    // Reconcile: a position that just appeared confirms the pending buy.
-    if (held !== undefined) {
-      if (entryClose === 0) {
-        entryClose = pendingEntry !== 0 ? pendingEntry : close;
-        peakSinceEntry = Math.max(entryClose, close);
-        barsHeld = 0;
-      }
-      if (close > peakSinceEntry) peakSinceEntry = close;
-      barsHeld++;
-    } else {
-      entryClose = 0;
-      peakSinceEntry = 0;
-      barsHeld = 0;
-      // No position: a buy sent last batch was rejected (or none was sent),
-      // so a stale pending entry close must not carry into a later position.
-      pendingEntry = 0;
-    }
-    if (cooldown > 0) cooldown--;
+    // Trailing return over `win` bars, in basis points, from closes only.
+    const trailingReturn = (win: number): number => {
+      if (closes.length <= win) return 0;
+      return (close / closes[closes.length - 1 - win] - 1) * 10000;
+    };
 
-    if (held !== undefined) {
-      const r = ret30();
-      const decayed = r !== null && r < EXIT_RET;
-      const tookProfit = close >= entryClose * (1 + TAKE_PROFIT);
-      const trailed = close < peakSinceEntry * (1 - TRAIL);
-      const timedOut = barsHeld >= MAX_HOLD;
-      if (decayed || tookProfit || trailed || timedOut) {
-        const sell: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS };
-        cooldown = COOLDOWN;
-        return [sell];
-      }
+    const buyAll = (nextMode: 'scalp' | 'trend') => {
+      if (state.warmingUp || state.cash <= 0n) return [];
+      entryClose = close;
+      peak = close;
+      mode = nextMode;
+      return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    };
+    const sellAll = () => {
+      if (!inPosition) return [];
+      coolLeft = COOL_BARS;
+      mode = '';
+      return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    };
+
+    if (!inPosition) {
+      if (coolLeft > 0 || closes.length <= LONG_WIN) return [];
+      if (trailingReturn(LONG_WIN) > LONG_UP_BPS) return buyAll('trend');
+      if (trailingReturn(SHORT_WIN) > SCALP_IN_BPS) return buyAll('scalp');
       return [];
     }
 
-    if (cooldown > 0) return [];
-    const r = ret30();
-    if (r !== null && r > ENTRY_RET) {
-      const cash = state.cash;
-      if (cash < BigInt(state.hello.fees.min_notional_quote_units)) return [];
-      pendingEntry = close;
-      const buy: BuyInput = { side: 'buy', symbol: SYMBOL, notional_quote_units: cash, max_slippage_bps: MAX_SLIPPAGE_BPS };
-      return [buy];
+    // A scalp open when the slow trend confirms becomes a trend hold.
+    if (mode === 'scalp' && trailingReturn(LONG_WIN) > LONG_UP_BPS) mode = 'trend';
+    const trailBps = mode === 'trend' ? TREND_TRAIL_BPS : SCALP_TRAIL_BPS;
+    if (peak > 0 && close < peak * (1 - trailBps / 10000)) return sellAll();
+    if (mode === 'scalp') {
+      if (entryClose > 0 && close >= entryClose * (1 + SCALP_TP_BPS / 10000)) return sellAll();
+      if (trailingReturn(SHORT_WIN) < SCALP_OUT_BPS) return sellAll();
     }
     return [];
   },
