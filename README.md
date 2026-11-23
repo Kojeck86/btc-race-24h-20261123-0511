@@ -1,8 +1,8 @@
 # Momentum Trend-State Bot — btc-race-24h-20261123-0511
 
 [![make.fun](https://make.fun/badge/btc-race-24h-20261123-0511.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261123-0511)
-[![Rank](https://make.fun/badge/btc-race-24h-20261123-0511/Kojeck86/btc-race-24h-20261123-0511-repo/rank.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511/leaderboard)
-[![Reward](https://make.fun/badge/btc-race-24h-20261123-0511/Kojeck86/btc-race-24h-20261123-0511-repo/reward.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261123-0511)
+[![Rank](https://make.fun/badge/btc-race-24h-20261123-0511/Kojeck86/btc-race-24h-20261123-0511/rank.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261123-0511)
+[![Reward](https://make.fun/badge/btc-race-24h-20261123-0511/Kojeck86/btc-race-24h-20261123-0511/reward.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261123-0511)
 
 A long-only cbBTC/USDC bot for the make.fun 24-hour bars-replay race. It
 holds only while a strong 30-minute momentum regime is on: enter when the
